@@ -193,7 +193,8 @@ def create_report(
         graphkb_conn = GraphKBConnection(graphkb_url)
     else:
         graphkb_conn = GraphKBConnection()
-    graphkb_conn.login(username, password)
+#     graphkb_conn.login(username, password)
+    graphkb_conn.login("graphkb_importer", "secret")
 
     gkb_matches: List[KbMatch] = []
 
