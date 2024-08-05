@@ -1,10 +1,12 @@
 import argparse
 import datetime
 import json
+import jsonschema.exceptions
 import logging
 import os
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from graphkb import GraphKBConnection
+from graphkb.genes import get_gene_information
 from typing import Dict, List, Sequence
 
 from .annotate import (
@@ -12,10 +14,10 @@ from .annotate import (
     annotate_expression_variants,
     annotate_msi,
     annotate_positional_variants,
-    get_gene_information,
+    annotate_tmb,
 )
 from .connection import IprConnection
-from .constants import DEFAULT_URL
+from .constants import DEFAULT_URL, TMB_HIGH, TMB_HIGH_CATEGORY
 from .inputs import (
     check_comparators,
     check_variant_links,
@@ -37,6 +39,11 @@ from .types import IprVariant, KbMatch
 from .util import LOG_LEVELS, logger, trim_empty_values
 
 CACHE_GENE_MINIMUM = 5000
+RENAMED_GENE_PROPERTIES = {
+    # old_name: new_name
+    'cancerRelated': 'kbStatementRelated',
+    'cancerGene': 'cancerGeneListMatch',
+}
 
 
 def file_path(path: str) -> str:
@@ -103,23 +110,85 @@ def command_interface() -> None:
     )
 
 
-def clean_unsupported_content(upload_content: Dict) -> Dict:
-    """
-    Remove unsupported content. This content is either added to facilitate creation
+def clean_unsupported_content(upload_content: Dict, ipr_spec: Dict = {}) -> Dict:
+    """Remove unsupported content.
+    This content is either added to facilitate creation
     or to support upcoming and soon to be supported content that we would like
     to implement but is not yet supported by the upload
     """
+    if (
+        ipr_spec
+        and 'components' in ipr_spec.keys()
+        and 'schemas' in ipr_spec['components'].keys()
+        and 'genesCreate' in ipr_spec['components']['schemas'].keys()
+        and 'properties' in ipr_spec['components']['schemas']['genesCreate'].keys()
+    ):
+        genes_spec = ipr_spec['components']['schemas']['genesCreate']['properties'].keys()
+
+        # check what ipr report upload expects and adjust contents to match
+        for old_name, new_name in RENAMED_GENE_PROPERTIES.items():
+            if old_name in genes_spec:
+                logger.warning(
+                    f"Legacy IPR - Renaming property {new_name} to {old_name} for compatibility to ipr_spec"
+                )
+                for gene in upload_content['genes']:
+                    if new_name in gene:
+                        gene[old_name] = gene[new_name]
+                        gene.pop(new_name)
+            else:
+                outdate_properties = 0
+                for gene in upload_content['genes']:
+                    if old_name in gene:
+                        gene[new_name] = gene[old_name]
+                        gene.pop(old_name)
+                        outdate_properties += 1
+                if outdate_properties:
+                    logger.warning(
+                        f"Renamed property {old_name} to {new_name} on {outdate_properties} genes for ipr_spec"
+                    )
+
+        # remove any unhandled incompatible keys
+        removed_keys: Dict[str, int] = {}
+        for gene in upload_content['genes']:
+            unsupported_keys = [key for key in gene.keys() if key not in genes_spec]
+            for key in unsupported_keys:
+                if key in removed_keys:
+                    removed_keys[key] += 1
+                else:
+                    removed_keys[key] = 1
+                gene.pop(key)
+        for key, count in removed_keys.items():
+            logger.warning(f"IPR unsupported property '{key}' removed from {count} genes.")
+
     drop_columns = ['variant', 'variantType', 'histogramImage']
-    for variant_section in [
+    # DEVSU-2034 - use a 'displayName'
+    VARIANT_LIST_KEYS = [
         'expressionVariants',
         'smallMutations',
         'copyVariants',
         'structuralVariants',
-    ]:
-        for variant in upload_content[variant_section]:
+        'probeResults',
+        'msi',
+    ]
+    for variant_list_section in VARIANT_LIST_KEYS:
+        for variant in upload_content.get(variant_list_section, []):
+            if not variant.get('displayName'):
+                variant['displayName'] = (
+                    variant.get('variant') or variant.get('kbCategory') or variant.get('key', '')
+                )
+            if variant_list_section == 'probeResults':
+                # currently probeResults will error if they do NOT have a 'variant' column.
+                # smallMutations will error if they DO have a 'variant' column.
+                continue
             for col in drop_columns:
                 if col in variant:
                     del variant[col]
+    # tmburMutationBurden is a single value, not list
+    if upload_content.get('tmburMutationBurden'):
+        if not upload_content['tmburMutationBurden'].get('displayName'):
+            upload_content['tmburMutationBurden']['displayName'] = upload_content[
+                'tmburMutationBurden'
+            ].get('kbCategory', '')
 
     for row in upload_content['kbMatches']:
         del row['kbContextId']
@@ -127,7 +196,12 @@ def clean_unsupported_content(upload_content: Dict) -> Dict:
     return upload_content
 
 
-def create_report(
+def create_report(**kwargs) -> Dict:
+    logger.warning("Deprecated function 'create_report' called - use ipr_report instead")
+    return ipr_report(**kwargs)
+
+
+def ipr_report(
     username: str,
     password: str,
     content: Dict,
@@ -171,7 +245,12 @@ def create_report(
         datefmt='%m-%d-%y %H:%M:%S',
     )
     # validate the JSON content follows the specification
-    validate_report_content(content)
+    try:
+        validate_report_content(content)
+    except jsonschema.exceptions.ValidationError as err:
+        logger.error("Failed schema check - report variants may be corrupted or unmatched.")
+        logger.error(f"Failed schema check: {err}")
+
     kb_disease_match = content['kbDiseaseMatch']
 
     # validate the input variants
@@ -188,6 +267,8 @@ def create_report(
 
     # Setup connections
     ipr_conn = IprConnection(username, password, ipr_url)
+    ipr_spec = ipr_conn.get_spec()
+
     if graphkb_url:
         logger.info(f'connecting to graphkb: {graphkb_url}')
         graphkb_conn = GraphKBConnection(graphkb_url)
@@ -199,10 +280,38 @@ def create_report(
     gkb_matches: List[KbMatch] = []
 
     # Signature category variants
+    tmb_variant: IprVariant = {}
+    tmb_matches = []
     if 'tmburMutationBurden' in content.keys():
-        logger.warning(
-            'GERO-296 - not yet implemented - high tumour mutation burden category matching.'
-        )
+        tmb_val = 0.0
+        tmb = {}
+        try:
+            tmb = content.get('tmburMutationBurden', {})
+            tmb_val = tmb['genomeIndelTmb'] + tmb['genomeSnvTmb']
+        except Exception as err:
+            logger.error(f"tmburMutationBurden parsing failure: {err}")
+
+        if tmb_val >= TMB_HIGH:
+            logger.warning(
+                f'GERO-296 - tmburMutationBurden high -checking graphkb matches for {TMB_HIGH_CATEGORY}'
+            )
+            if not tmb.get('key'):
+                tmb['key'] = TMB_HIGH_CATEGORY
+            if not tmb.get('kbCategory'):
+                tmb['kbCategory'] = TMB_HIGH_CATEGORY
+
+            # GERO-296 - try matching to graphkb
+            tmb_matches = annotate_tmb(graphkb_conn, kb_disease_match, TMB_HIGH_CATEGORY)
+            if tmb_matches:
+                tmb_variant['kbCategory'] = TMB_HIGH_CATEGORY  # type: ignore
+                tmb_variant['variant'] = TMB_HIGH_CATEGORY
+                tmb_variant['key'] = tmb['key']
+                tmb_variant['variantType'] = 'tmb'
+                logger.info(
+                    f"GERO-296 '{TMB_HIGH_CATEGORY}' matches {len(tmb_matches)} statements."
+                )
+                gkb_matches.extend(tmb_matches)
+                logger.debug(f"\tgkb_matches: {len(gkb_matches)}")
 
     msi = content.get('msi', [])
     msi_matches = []
@@ -217,7 +326,7 @@ def create_report(
             msi_cat = msi.get('kbCategory')
             msi_variant = msi.copy()
         logger.info(f'Matching GKB msi {msi_cat}')
-        msi_matches = annotate_msi(graphkb_conn, msi_cat, kb_disease_match)
+        msi_matches = annotate_msi(graphkb_conn, kb_disease_match, msi_cat)
         if msi_matches:
             msi_variant['kbCategory'] = msi_cat  # type: ignore
             msi_variant['variant'] = msi_cat
@@ -263,6 +372,8 @@ def create_report(
     all_variants = expression_variants + copy_variants + structural_variants + small_mutations  # type: ignore
     if msi_matches:
         all_variants.append(msi_variant)  # type: ignore
+    if tmb_matches:
+        all_variants.append(tmb_variant)  # type: ignore
 
     if match_germline:  # verify germline kb statements matched germline observed variants
         gkb_matches = germline_kb_matches(gkb_matches, all_variants)
@@ -327,7 +438,7 @@ def create_report(
     )
     output.setdefault('images', []).extend(select_expression_plots(gkb_matches, all_variants))
 
-    output = clean_unsupported_content(output)
+    output = clean_unsupported_content(output, ipr_spec)
     ipr_result = None
     upload_error = None
 

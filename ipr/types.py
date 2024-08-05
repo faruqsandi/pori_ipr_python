@@ -1,4 +1,4 @@
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Dict
 
 try:
     from typing import TypedDict  # type: ignore
@@ -30,16 +30,18 @@ class KbMatch(TypedDict):
     externalSource: str
     externalStatementId: str
     reviewStatus: str
+    kbData: Optional[Dict]
 
 
 class IprGene(TypedDict):
     name: str
-    cancerRelated: Optional[bool]
+    kbStatementRelated: Optional[bool]
     knownFusionPartner: Optional[bool]
     knownSmallMutation: Optional[bool]
     tumourSuppressor: Optional[bool]
     oncogene: Optional[bool]
     therapeuticAssociated: Optional[bool]
+    cancerGeneListMatch: Optional[bool]
 
 
 class IprVariantBase(TypedDict):
